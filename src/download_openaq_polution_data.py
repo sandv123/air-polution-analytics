@@ -104,10 +104,6 @@ def get_measurements(client: openaq.OpenAQ, sensor_id: int, year: int, page_num:
     return result
 
 
-def is_running_in_databricks() -> bool:
-    return "DATABRICKS_RUNTIME_VERSION" in os.environ
-
-
 if __name__ == "__main__":
 
     # OpenAQ API key
