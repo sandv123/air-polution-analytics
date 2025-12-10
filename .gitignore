@@ -1,0 +1,6 @@
+
+.databricks
+.venv
+.vscode
+data
+databricks.yml
