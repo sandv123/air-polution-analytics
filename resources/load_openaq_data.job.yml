@@ -1,0 +1,24 @@
+# Load Belgrade polution data through OpenAQ API job
+  jobs:
+    load_openaq_data:
+      name: Load Belgrade polution data through OpenAQ API
+
+      description: Job to run python script, calling OpenAQ API to extract the Belgrade polution data for the past 5 years
+      max_concurrent_runs: 1
+
+      tasks:
+        - task_key: run_data_load_script
+          environment_key: default
+          disable_auto_optimization: true # This will disable automatic reties
+          spark_python_task:
+            parameters:
+              - "--datastore_path"
+              - "/Volumes/workspace/air_polution_analytics/data/"
+            python_file: ../src/download_openaq_polution_data.py
+
+      environments:
+        - environment_key: default
+          spec:
+            dependencies:
+              - openaq
+            environment_version: "4"
