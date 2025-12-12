@@ -3,6 +3,7 @@ import json
 import os
 import time
 from typing import Any
+import httpcore
 import openaq
 import zipfile
 from itertools import product
@@ -34,19 +35,20 @@ class OpenAQConnectionManager:
             self.client.close()
 
 
-    def recycle_client(self) -> openaq.OpenAQ:
+    def recycle_client(self, timeout: float) -> openaq.OpenAQ:
         """
-        Get a client object. If exists, cycle it by closing and opening anew
+        Get a client object. If exists, cycle it by closing, sleep for {timeout} seconds, and opening anew
 
         :return: OpenAQ client object
         :rtype: openaq.OpenAQ
         """
         if self.client is not None:
             self.client.close()
+            time.sleep(timeout)
         
         client = openaq.OpenAQ(self._api_key)
         return client
-    
+
 
 def get_measurements(client: openaq.OpenAQ, sensor_id: int, year: int, page_num: int) -> dict[str, Any]:
     """
@@ -72,7 +74,7 @@ def get_measurements(client: openaq.OpenAQ, sensor_id: int, year: int, page_num:
     sleep_seconds = 0
 
     # Initialize measurements variable
-    measurements = client.measurements.list(sensors_id=sensor_id, limit=1)
+    measurements = None
 
     try:
         # Call the OpenAQ API
@@ -81,7 +83,7 @@ def get_measurements(client: openaq.OpenAQ, sensor_id: int, year: int, page_num:
             datetime_from=f'{year}-01-01',
             datetime_to=f'{year}-12-31',
             limit=limit, page=page_num)
-        print(f'  page={page_num} len={len(measurements.results)}', measurements.headers)
+        # print(f'  page={page_num} len={len(measurements.results)}', measurements.headers)
         
         # Pages are retrieved until current page returns zero results
         if not len(measurements.results) == 0:
@@ -95,10 +97,11 @@ def get_measurements(client: openaq.OpenAQ, sensor_id: int, year: int, page_num:
     except openaq.TimeoutError as e:
         # If timed out or throttling, sleep until the rate limit resets or 60 seconds
         # Raise exception to pass the info up the callstack
-        if measurements.headers.x_ratelimit_reset is None:
-            sleep_seconds = 60
-        else:
-            sleep_seconds = float(measurements.headers.x_ratelimit_reset)
+        if measurements is not None:
+            if measurements.headers.x_ratelimit_reset is None:
+                sleep_seconds = 60
+            else:
+                sleep_seconds = float(measurements.headers.x_ratelimit_reset)
         # print(f'TIMED OUT, sleeping {sleep_seconds} seconds, retry page {page_num}')
 
         raise TimeoutErrorExt(e, sleep_seconds)
@@ -127,11 +130,22 @@ def setup_environment() -> tuple[str, str]:
 
     return (api_key, datastore)
 
+
+def mark_finished_chunk(datastore: str, name: str) -> None:
+    with open(datastore + f'{name}.finished', 'w') as f:
+        f.write("done")
+        f.flush()
+
+
+def check_finished_chunk(datastore: str, name: str) -> bool:
+    return os.path.exists(datastore + f'{name}.finished')
+
+
 def main():
     api_key, datastore = setup_environment()
 
     connection_mgr = OpenAQConnectionManager(api_key)
-    client = connection_mgr.recycle_client()
+    client = connection_mgr.recycle_client(0)
 
     # Geo coords for Belgrade, RS
     belgrade_coordinates = (44.8125, 20.4612)
@@ -145,10 +159,12 @@ def main():
     # Find all available locations in the radius of 8 km around Belgrade center
     locations = client.locations.list(coordinates=belgrade_coordinates, radius=8000, limit=1000)
 
+    # locations = client.locations.get(2812630) # This is for debugging purposes
+
     # Store the locations for processing
     store_zipped(datastore + 'Belgrade-locations.json.zip', json.dumps(locations.json(), indent=4))
     print(f'Got {len(locations.results)} locations')
-    
+
     for l in locations.results:
         name = l.name.replace(' ', '-')
 
@@ -156,22 +172,30 @@ def main():
         # If no sensor measures interesting parameter, skip the parameter
         sensors_parameters = {s.parameter.name: s.id  for s in l.sensors}
         sensor_ids = filter(lambda f: f != 0, map(lambda x: sensors_parameters.get(x, 0), parameters))
-        
+        print(f'Downloading measurements for station {name}')
+
+        # years = [2025] # This is for debugging purposes
+ 
         timed_out = 0
-        for args in product(years, sensor_ids):
+        for year_and_sensor in product(years, sensor_ids):
+            year_and_sensor_name = f'{l.id}_{year_and_sensor[1]}_{l.country.code}_{name}_{year_and_sensor[0]}'
+            print(f'  Downloading chunk {year_and_sensor_name}')
+            if check_finished_chunk(datastore, year_and_sensor_name):
+                print(f'  Chunk {year_and_sensor_name} already downloaded, skipping')
+                continue
+
             page_num = 0
             while True:
                 page_num += 1
-                filename = f'{l.id}_{args[1]}_{l.country.code}_{name}_{args[0]}_page{page_num}.json'
-                print(f'Downloading chunk {filename}')
+                filename = f'{year_and_sensor_name}_page{page_num}.json'
 
                 # If a page has already been downloaded, skip it
                 if os.path.exists(datastore + filename + '.zip'):
-                    print(f'  Chunk {filename}.zip exists, skipping')
+                    print(f'    Page {filename}.zip exists, skipping')
                     continue
 
                 try:
-                    page = get_measurements(client, args[1], args[0], page_num)
+                    page = get_measurements(client, year_and_sensor[1], year_and_sensor[0], page_num)
                     timed_out = 0
                     if not page:
                         break
@@ -180,15 +204,32 @@ def main():
                     store_zipped(datastore + filename + '.zip', json.dumps(page, indent=4))
                 except TimeoutErrorExt as e:
                     if timed_out == 3:
-                        # If the API timed out 3 times in a row, cancel trying and bail the whole thing
-                        print('  Timed out 3 times, canceling')
+                        print(f'  Timed out (API) 3 times, skipping page {filename}')
+                        client = connection_mgr.recycle_client(0)
+                        timed_out += 1
+                        continue
+                    if timed_out == 5:
+                        print(f'  Timed out (API) 5 times, skipping chunk {name}')
+                        client = connection_mgr.recycle_client(0)
+                        timed_out += 1
+                        break
+                    if timed_out == 7:    
+                        # If the API timed out 7 times in a row, cancel trying and bail the whole thing
+                        print('  Timed out (API) 7 times, canceling')
                         raise e
                     else:
                         # If the API timed out, try resetting the connection and wait for the API suggested amount of seconds
-                        print(f'TIMED OUT, sleeping for {e.timeout_seconds} seconds, {e}')
+                        time_to_sleep = e.timeout_seconds + 60 * timed_out
+                        print(f'TIMED OUT OPENAQ, sleeping for {time_to_sleep} seconds, {e}')
                         timed_out += 1
-                        time.sleep(e.timeout_seconds)
-                        client = connection_mgr.recycle_client()
+                        client = connection_mgr.recycle_client(time_to_sleep)
+                except httpcore.ReadTimeout as e:
+                    print(f'TIMED OUT HTTP READ, sleeping for 60 seconds, {e}')
+                    client = connection_mgr.recycle_client(60)
+                except TimeoutError as e:
+                    print(f'TIMED OUT NETWORK/IO, sleeping for 60 seconds, {e}')
+                    client = connection_mgr.recycle_client(60)
+            mark_finished_chunk(datastore, year_and_sensor_name)
 
 
 def store_zipped(filename: str, data: str):
