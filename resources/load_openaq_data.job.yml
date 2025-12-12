@@ -10,11 +10,13 @@ resources:
       tasks:
         - task_key: run_data_load_script
           environment_key: default
-          disable_auto_optimization: true # This will disable automatic reties
+          # disable_auto_optimization: true # This will disable automatic reties
+          max_retries: 10
+          min_retry_interval_millis: 60000
           spark_python_task:
             parameters:
               - "--datastore_path"
-              - "/Volumes/workspace/air_polution_analytics/data/"
+              - "/Volumes/workspace/air_polution_analytics/data/openaq_air_quality/new/"
             python_file: ../src/download_openaq_polution_data.py
 
       environments:
